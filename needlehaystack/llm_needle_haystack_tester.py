@@ -38,6 +38,8 @@ class LLMNeedleHaystackTester:
                  final_context_length_buffer = 200,
                  seconds_to_sleep_between_completions = None,
                  print_ongoing_status = True,
+                 use_cllp_filter: bool = False,
+                 cllp_ckpt_path: str = "models/cllp_final.pth",
                  **kwargs):
         """
         :model_to_test: The model to test. Default is None.
@@ -79,6 +81,8 @@ class LLMNeedleHaystackTester:
         self.seconds_to_sleep_between_completions = seconds_to_sleep_between_completions
         self.print_ongoing_status = print_ongoing_status
         self.testing_results = []
+        self.use_cllp_filter = use_cllp_filter
+        self.cllp_filter = None
 
         if context_lengths is None:
             if context_lengths_min is None or context_lengths_max is None or context_lengths_num_intervals is None:
@@ -103,6 +107,10 @@ class LLMNeedleHaystackTester:
                 raise ValueError("document_depth_percent_interval_type must be either 'sigmoid' or 'linear' if document_depth_percents is None.")
         else:
             self.document_depth_percents = document_depth_percents
+        
+        if self.use_cllp_filter:
+            from .clip_filter.clip_filter import CLLPFilter
+            self.cllp_filter = CLLPFilter(ckpt_path=cllp_ckpt_path)
         
         self.model_to_test = model_to_test
         self.model_name = self.model_to_test.model_name
@@ -144,6 +152,10 @@ class LLMNeedleHaystackTester:
 
         # Go generate the required length context and place your needle statement in
         context = await self.generate_context(context_length, depth_percent)
+
+        # If using CLLP filtering, filter the context down to the most relevant pieces
+        if self.cllp_filter is not None:
+            context = self.cllp_filter.filter_context(context, self.retrieval_question)
 
         # Prepare your message to send to the model you're going to evaluate
         prompt = self.model_to_test.generate_prompt(context, self.retrieval_question)

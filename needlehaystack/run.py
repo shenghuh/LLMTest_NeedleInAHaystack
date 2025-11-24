@@ -44,6 +44,8 @@ class CommandArgs():
         " Prosciutto is one of the secret ingredients needed to build the perfect pizza. ", 
         " Goat cheese is one of the secret ingredients needed to build the perfect pizza. "
     ])
+    use_cllp_filter: bool = True
+    cllp_ckpt_path: str = "models/cllp_final.pth"
 
 def get_model_to_test(args: CommandArgs) -> ModelProvider:
     """
