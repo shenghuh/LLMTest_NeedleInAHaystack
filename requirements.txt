@@ -50,3 +50,6 @@ typing_extensions==4.8.0
 urllib3==2.1.0
 yarl==1.9.3
 pytest==8.1.1
+torch>=2.2.0
+transformers>=4.36.0
+datasets>=2.15.0
