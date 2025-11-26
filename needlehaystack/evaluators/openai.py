@@ -3,7 +3,7 @@ import os
 from .evaluator import Evaluator
 
 from langchain.evaluation import load_evaluator
-from langchain_community.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 
 class OpenAIEvaluator(Evaluator):
     DEFAULT_MODEL_KWARGS: dict = dict(temperature=0)
@@ -31,7 +31,7 @@ class OpenAIEvaluator(Evaluator):
             raise ValueError("true_answer and question_asked must be supplied with init.")
 
         self.model_name = model_name
-        self.model_kwargs = model_kwargs
+        self.model_kwargs = dict(model_kwargs)  # make a copy
         self.true_answer = true_answer
         self.question_asked = question_asked
 
@@ -40,10 +40,30 @@ class OpenAIEvaluator(Evaluator):
             raise ValueError("NIAH_EVALUATOR_API_KEY must be in env for using openai evaluator.")
 
         self.api_key = api_key
-        
-        self.evaluator = ChatOpenAI(model=self.model_name,
-                                    openai_api_key=self.api_key,
-                                    **self.model_kwargs)
+
+        # For modern models (gpt-4.1, 4o, 5, 5-mini, etc.) we must **explicitly**
+        # set temperature=1, otherwise LangChain will default to 0.7 and the API
+        # will reject it.
+        if self._uses_modern_api():
+            self.model_kwargs["temperature"] = 1
+        # For legacy models we keep whatever was passed (often temperature=0).
+
+        self.evaluator = ChatOpenAI(
+            model=self.model_name,
+            api_key=self.api_key,
+            **self.model_kwargs,
+        )
+
+    def _uses_modern_api(self) -> bool:
+        modern_prefixes = (
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4.5",
+            "gpt-5",
+            "gpt-5.1",
+            "gpt-5-mini",
+        )
+        return self.model_name.startswith(modern_prefixes)
 
     def evaluate_response(self, response: str) -> int:
         evaluator = load_evaluator(

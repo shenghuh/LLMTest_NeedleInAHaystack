@@ -45,23 +45,51 @@ class OpenAI(ModelProvider):
         self.model_kwargs = model_kwargs
         self.api_key = api_key
         self.model = AsyncOpenAI(api_key=self.api_key)
-        self.tokenizer = tiktoken.encoding_for_model(self.model_name)
-    
+        try:
+            self.tokenizer = tiktoken.encoding_for_model(self.model_name)
+        except KeyError:
+            # Fallback for very new models that tiktoken doesn't know yet
+            # `o200k_base` is used for the latest long-context models
+            self.tokenizer = tiktoken.get_encoding("o200k_base")
+
+    def _uses_modern_api(self) -> bool:
+        """
+        Heuristic: newer models that use the newer API behavior.
+        """
+        modern_prefixes = (
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4.5",
+            "gpt-5",
+            "gpt-5.1",
+            "gpt-5-mini",
+        )
+        return self.model_name.startswith(modern_prefixes)
+
+    def _build_chat_kwargs(self) -> dict:
+        """
+        Convert self.model_kwargs into kwargs compatible with this model.
+        For old models -> keep `max_tokens` and `temperature`.
+        For new models -> drop `max_tokens` and `temperature`
+                           (use server defaults).
+        """
+        kwargs = dict(self.model_kwargs)  # shallow copy
+
+        if self._uses_modern_api():
+            # Newer models don't like `max_tokens` OR non-default temperature
+            kwargs.pop("max_tokens", None)
+            kwargs.pop("temperature", None)
+
+        return kwargs
+
     async def evaluate_model(self, prompt: str) -> str:
-        """
-        Evaluates a given prompt using the OpenAI model and retrieves the model's response.
+        chat_kwargs = self._build_chat_kwargs()
 
-        Args:
-            prompt (str): The prompt to send to the model.
-
-        Returns:
-            str: The content of the model's response to the prompt.
-        """
         response = await self.model.chat.completions.create(
-                model=self.model_name,
-                messages=prompt,
-                **self.model_kwargs
-            )
+            model=self.model_name,
+            messages=prompt,
+            **chat_kwargs,
+        )
         return response.choices[0].message.content
     
     def generate_prompt(self, context: str, retrieval_question: str) -> str | list[dict[str, str]]:
@@ -146,12 +174,17 @@ class OpenAI(ModelProvider):
             input_variables=["context", "question"],
         )
         # Create a LangChain runnable
-        model = ChatOpenAI(temperature=0, model=self.model_name)
-        chain = ( {"context": lambda x: context,
-                  "question": itemgetter("question")} 
-                | prompt 
-                | model 
-                )
+        if self._uses_modern_api():
+            temp = 1  # required/default for new models like gpt-5-mini
+        else:
+            temp = 0  # what you wanted originally for older chat models
+
+        model = ChatOpenAI(temperature=temp, model=self.model_name)
+        chain = (
+            {"context": lambda x: context, "question": itemgetter("question")}
+            | prompt
+            | model
+        )
         return chain
     
 
