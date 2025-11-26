@@ -6,10 +6,6 @@ from datasets import load_dataset
 import random
 
 class ClipMiniPileDataset(Dataset):
-	"""
-	Dataset wrapper for MiniPile text data.
-	Tokenizes text and creates fixed-length sequences.
-	"""
 	def __init__(self, tokenizer, split='train', max_length=512, query_max_length=128, max_samples=None):
 		super(ClipMiniPileDataset, self).__init__()
 

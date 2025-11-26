@@ -2,15 +2,18 @@ import os
 from operator import itemgetter
 from typing import Optional
 
-from openai import AsyncOpenAI
 from langchain_openai import ChatOpenAI  
 from langchain_core.prompts import PromptTemplate
 import tiktoken
+from transformers import pipeline
+import torch
 
 from .model import ModelProvider
+from langchain_classic.evaluation import load_evaluator
+from ..evaluators import Evaluator
 
 
-class OpenAI(ModelProvider):
+class OpenSource(ModelProvider, Evaluator):
     """
     A wrapper class for interacting with OpenAI's API, providing methods to encode text, generate prompts,
     evaluate models, and create LangChain runnables for language model interactions.
@@ -21,12 +24,35 @@ class OpenAI(ModelProvider):
         tokenizer: A tokenizer instance for encoding and decoding text to and from token representations.
     """
         
-    DEFAULT_MODEL_KWARGS: dict = dict(max_tokens  = 300,
-                                      temperature = 0)
+    DEFAULT_MODEL_KWARGS: dict = dict(
+        max_new_tokens = 300,
+        max_tokens = 300,
+        temperature = 0,
+    )
+    def evaluate_response(self, input, ref, response):
+        evaluator = load_evaluator(
+            "labeled_score_string",
+            criteria=self.CRITERIA,
+            llm=self.model,
+        )
+
+        eval_result = evaluator.evaluate_strings(
+            # The models response
+            prediction=response,
+
+            # The actual answer
+            reference=ref,
+
+            # The question asked
+            input=input,
+        )
+
+        return int(eval_result['score'])
 
     def __init__(self,
-                 model_name: str = "gpt-3.5-turbo-0125",
-                 model_kwargs: dict = DEFAULT_MODEL_KWARGS):
+                 model_name: str = "gpt-oss-20b",
+                 model_kwargs: dict = DEFAULT_MODEL_KWARGS,
+                 **kwargs):
         """
         Initializes the OpenAI model provider with a specific model.
 
@@ -37,14 +63,15 @@ class OpenAI(ModelProvider):
         Raises:
             ValueError: If NIAH_MODEL_API_KEY is not found in the environment.
         """
-        api_key = os.getenv('NIAH_MODEL_API_KEY')
-        if (not api_key):
-            raise ValueError("NIAH_MODEL_API_KEY must be in env.")
 
         self.model_name = model_name
         self.model_kwargs = model_kwargs
-        self.api_key = api_key
-        self.model = AsyncOpenAI(api_key=self.api_key)
+        self.model = pipeline(
+            "text-generation",
+            model=model_name,
+            torch_dtype="auto",
+            device_map="auto",
+        )
         self.tokenizer = tiktoken.encoding_for_model(self.model_name)
     
     async def evaluate_model(self, prompt: str) -> str:
@@ -57,12 +84,11 @@ class OpenAI(ModelProvider):
         Returns:
             str: The content of the model's response to the prompt.
         """
-        response = await self.model.chat.completions.create(
-                model=self.model_name,
-                messages=prompt,
-                **self.model_kwargs
-            )
-        return response.choices[0].message.content
+        response = self.model(
+            prompt,
+            **self.model_kwargs
+        )
+        return response[0]['generated_text']
     
     def generate_prompt(self, context: str, retrieval_question: str) -> str | list[dict[str, str]]:
         """
@@ -134,24 +160,24 @@ class OpenAI(ModelProvider):
                 - Define the context and question.
                 - Execute the runnable with these parameters to get the model's response.
         """
-
-        template = """You are a helpful AI bot that answers questions for a user. Keep your response short and direct" \n
-        \n ------- \n 
-        {context} 
-        \n ------- \n
-        Here is the user question: \n --- --- --- \n {question} \n Don't give information outside the document or repeat your findings."""
+        return None
+        # template = """You are a helpful AI bot that answers questions for a user. Keep your response short and direct" \n
+        # \n ------- \n 
+        # {context} 
+        # \n ------- \n
+        # Here is the user question: \n --- --- --- \n {question} \n Don't give information outside the document or repeat your findings."""
         
-        prompt = PromptTemplate(
-            template=template,
-            input_variables=["context", "question"],
-        )
-        # Create a LangChain runnable
-        model = ChatOpenAI(temperature=0, model=self.model_name)
-        chain = ( {"context": lambda x: context,
-                  "question": itemgetter("question")} 
-                | prompt 
-                | model 
-                )
-        return chain
+        # prompt = PromptTemplate(
+        #     template=template,
+        #     input_variables=["context", "question"],
+        # )
+        # # Create a LangChain runnable
+        # model = ChatOpenAI(temperature=0, model=self.model_name)
+        # chain = ( {"context": lambda x: context,
+        #           "question": itemgetter("question")} 
+        #         | prompt 
+        #         | model 
+        #         )
+        # return chain
     
 

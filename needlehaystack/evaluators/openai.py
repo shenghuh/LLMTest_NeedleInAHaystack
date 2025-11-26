@@ -2,7 +2,7 @@ import os
 
 from .evaluator import Evaluator
 
-from langchain.evaluation import load_evaluator
+from langchain_classic.evaluation import load_evaluator
 from langchain_community.chat_models import ChatOpenAI
 
 class OpenAIEvaluator(Evaluator):

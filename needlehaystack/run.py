@@ -6,16 +6,17 @@ from jsonargparse import CLI
 
 from . import LLMNeedleHaystackTester, LLMMultiNeedleHaystackTester
 from .evaluators import Evaluator, LangSmithEvaluator, OpenAIEvaluator
-from .providers import Anthropic, ModelProvider, OpenAI, Cohere
+from .providers import Anthropic, ModelProvider, OpenAI, Cohere, OpenSource
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
 @dataclass
 class CommandArgs():
-    provider: str = "openai"
-    evaluator: str = "openai"
-    model_name: str = "gpt-3.5-turbo-0125"
-    evaluator_model_name: Optional[str] = "gpt-3.5-turbo-0125"
+    provider: str = "opensource"
+    evaluator: str = "opensource"
+    model_name: str = "gpt-oss-20b"
+    evaluator_model_name: Optional[str] = "gpt-oss-20b"
     needle: Optional[str] = "\nThe best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.\n"
     haystack_dir: Optional[str] = "PaulGrahamEssays"
     retrieval_question: Optional[str] = "What is the best thing to do in San Francisco?"
@@ -23,7 +24,7 @@ class CommandArgs():
     context_lengths_min: Optional[int] = 1000
     context_lengths_max: Optional[int] = 16000
     context_lengths_num_intervals: Optional[int] = 35
-    context_lengths: Optional[list[int]] = None
+    context_lengths: Optional[list[int]] = field(default_factory=lambda: [32000, 48000, 64000, 96000, 128000])
     document_depth_percent_min: Optional[int] = 0
     document_depth_percent_max: Optional[int] = 100
     document_depth_percent_intervals: Optional[int] = 35
@@ -44,7 +45,8 @@ class CommandArgs():
         " Prosciutto is one of the secret ingredients needed to build the perfect pizza. ", 
         " Goat cheese is one of the secret ingredients needed to build the perfect pizza. "
     ])
-    use_cllp_filter: bool = True
+    use_cllp_filter: bool = False
+    filter_model_name: Optional[ModelProvider] = None
     cllp_ckpt_path: str = "models/cllp_final.pth"
 
 def get_model_to_test(args: CommandArgs) -> ModelProvider:
@@ -67,6 +69,8 @@ def get_model_to_test(args: CommandArgs) -> ModelProvider:
             return Anthropic(model_name=args.model_name)
         case "cohere":
             return Cohere(model_name=args.model_name)
+        case "opensource":
+            return get_opensource_model(args)
         case _:
             raise ValueError(f"Invalid provider: {args.provider}")
 
@@ -90,8 +94,25 @@ def get_evaluator(args: CommandArgs) -> Evaluator:
                                    true_answer=args.needle)
         case "langsmith":
             return LangSmithEvaluator()
+        case "opensource":
+            return get_opensource_model(args)
         case _:
             raise ValueError(f"Invalid evaluator: {args.evaluator}")
+        
+def get_filter_model(args: CommandArgs) -> Optional[ModelProvider]:
+    match args.filter_model_name.lower():
+        case "qwen":
+            return SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
+        case _:
+            return None
+        
+def get_opensource_model(args: CommandArgs):
+    match args.model_name.lower():
+        case "gpt-oss-20b":
+            args.model_name = "openai/gpt-oss-20b"
+            return OpenSource(**args.__dict__)
+        case _:
+            raise ValueError(f"Invalid opensource model: {args.provider}")
 
 def main():
     """
@@ -103,6 +124,7 @@ def main():
     args = CLI(CommandArgs, as_positional=False)
     args.model_to_test = get_model_to_test(args)
     args.evaluator = get_evaluator(args)
+    args.filter_model = get_filter_model(args)
     
     if args.multi_needle == True:
         print("Testing multi-needle")

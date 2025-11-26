@@ -39,6 +39,7 @@ class LLMNeedleHaystackTester:
                  seconds_to_sleep_between_completions = None,
                  print_ongoing_status = True,
                  use_cllp_filter: bool = False,
+                 filter_model = None,
                  cllp_ckpt_path: str = "models/cllp_final.pth",
                  **kwargs):
         """
@@ -111,7 +112,11 @@ class LLMNeedleHaystackTester:
         if self.use_cllp_filter:
             from .clip_filter.clip_filter import CLLPFilter
             self.cllp_filter = CLLPFilter(ckpt_path=cllp_ckpt_path)
-        
+        if self.filter_model:
+            from .clip_filter.filter import Filter
+            self.cllp_filter = Filter(model=self.filter_model)
+
+
         self.model_to_test = model_to_test
         self.model_name = self.model_to_test.model_name
         
@@ -169,7 +174,7 @@ class LLMNeedleHaystackTester:
         test_elapsed_time = test_end_time - test_start_time
 
         # Compare the reponse to the actual needle you placed
-        score = self.evaluation_model.evaluate_response(response)
+        score = self.evaluation_model.evaluate_response(self.retrieval_question, self.needle, response)
 
         results = {
             # 'context' : context, # Uncomment this line if you'd like to save the context the model was asked to retrieve from. Warning: This will become very large.
