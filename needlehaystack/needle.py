@@ -167,8 +167,7 @@ class LLMNeedleHaystackBenchmark:
             if self.cllp_filter is not None:
                 context = self.cllp_filter.filter_context(context, self.retrieval_question)
             elif self.filter is not None:
-                self.filter.process_context(context)
-                context = self.filter.filter_context(self.retrieval_question)
+                context = self.filter.filter_context(context, self.retrieval_question)
             contexts.append(context)
             prompts.append(self.model_to_test.generate_prompt(context, self.retrieval_question))
         
@@ -235,8 +234,7 @@ class LLMNeedleHaystackBenchmark:
         if self.cllp_filter is not None:
             context = self.cllp_filter.filter_context(context, self.retrieval_question)
         elif self.filter is not None:
-            self.filter.process_context(context)
-            context = self.filter.filter_context(self.retrieval_question)
+            context = self.filter.filter_context(context, self.retrieval_question)
 
         # Prepare your message to send to the model you're going to evaluate
         prompt = self.model_to_test.generate_prompt(context, self.retrieval_question)
