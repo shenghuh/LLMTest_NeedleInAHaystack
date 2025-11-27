@@ -27,7 +27,7 @@ class CommandArgs():
     context_lengths: Optional[list[int]] = field(default_factory=lambda: [32000, 48000, 64000, 96000, 128000])
     document_depth_percent_min: Optional[int] = 0
     document_depth_percent_max: Optional[int] = 100
-    document_depth_percent_intervals: Optional[int] = 35
+    document_depth_percent_intervals: Optional[int] = 10
     document_depth_percents: Optional[list[int]] = None
     document_depth_percent_interval_type: Optional[str] = "linear"
     num_concurrent_requests: Optional[int] = 1
@@ -46,7 +46,7 @@ class CommandArgs():
         " Goat cheese is one of the secret ingredients needed to build the perfect pizza. "
     ])
     use_cllp_filter: bool = False
-    filter_model_name: Optional[ModelProvider] = None
+    filter_model_name: Optional[ModelProvider] = "qwen"
     cllp_ckpt_path: str = "models/cllp_final.pth"
 
 def get_model_to_test(args: CommandArgs) -> ModelProvider:
@@ -122,9 +122,13 @@ def main():
     and initiates the testing process either for single-needle or multi-needle scenarios.
     """
     args = CLI(CommandArgs, as_positional=False)
-    args.model_to_test = get_model_to_test(args)
-    args.evaluator = get_evaluator(args)
+    model = get_opensource_model(args)
+    args.model_to_test = model
+    args.evaulator = model
     args.filter_model = get_filter_model(args)
+    # args.model_to_test = get_model_to_test(args)
+    # args.evaluator = get_evaluator(args)
+    # args.filter_model = get_filter_model(args)
     
     if args.multi_needle == True:
         print("Testing multi-needle")

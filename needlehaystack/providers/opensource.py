@@ -26,9 +26,9 @@ class OpenSource(ModelProvider, Evaluator):
         
     DEFAULT_MODEL_KWARGS: dict = dict(
         max_new_tokens = 300,
-        max_tokens = 300,
         temperature = 0,
     )
+
     def evaluate_response(self, input, ref, response):
         evaluator = load_evaluator(
             "labeled_score_string",
@@ -64,7 +64,7 @@ class OpenSource(ModelProvider, Evaluator):
             ValueError: If NIAH_MODEL_API_KEY is not found in the environment.
         """
 
-        self.model_name = model_name
+        self.model_name = model_name.split('/')[-1]
         self.model_kwargs = model_kwargs
         self.model = pipeline(
             "text-generation",

@@ -84,6 +84,8 @@ class LLMNeedleHaystackTester:
         self.testing_results = []
         self.use_cllp_filter = use_cllp_filter
         self.cllp_filter = None
+        self.filter_model = filter_model
+        self.filter = None
 
         if context_lengths is None:
             if context_lengths_min is None or context_lengths_max is None or context_lengths_num_intervals is None:
@@ -114,8 +116,7 @@ class LLMNeedleHaystackTester:
             self.cllp_filter = CLLPFilter(ckpt_path=cllp_ckpt_path)
         if self.filter_model:
             from .clip_filter.filter import Filter
-            self.cllp_filter = Filter(model=self.filter_model)
-
+            self.filter = Filter(model=self.filter_model)
 
         self.model_to_test = model_to_test
         self.model_name = self.model_to_test.model_name
@@ -161,6 +162,9 @@ class LLMNeedleHaystackTester:
         # If using CLLP filtering, filter the context down to the most relevant pieces
         if self.cllp_filter is not None:
             context = self.cllp_filter.filter_context(context, self.retrieval_question)
+        if self.filter is not None:
+            self.filter.process_context(context)
+            context = self.filter.filter_context(self.retrieval_question)
 
         # Prepare your message to send to the model you're going to evaluate
         prompt = self.model_to_test.generate_prompt(context, self.retrieval_question)
