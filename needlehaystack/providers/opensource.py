@@ -74,7 +74,7 @@ class OpenSource(ModelProvider, Evaluator):
         )
         self.tokenizer = tiktoken.encoding_for_model(self.model_name)
     
-    async def evaluate_model(self, prompt: str) -> str:
+    def evaluate_model(self, prompt: str) -> str:
         """
         Evaluates a given prompt using the OpenAI model and retrieves the model's response.
 
@@ -86,9 +86,41 @@ class OpenSource(ModelProvider, Evaluator):
         """
         response = self.model(
             prompt,
+            do_sample=False,
             **self.model_kwargs
         )
+        
+        # Clear GPU cache after each inference to prevent OOM with long contexts
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         return response[0]['generated_text']
+    
+    def evaluate_model_batch(self, prompts: list) -> list[str]:
+        """
+        Evaluates a batch of prompts using the model for more efficient GPU utilization.
+        Best used when prompts have similar lengths (e.g., same context length, different depth).
+
+        Args:
+            prompts (list): List of prompts to send to the model.
+
+        Returns:
+            list[str]: List of model responses corresponding to each prompt.
+        """
+        # Use the pipeline's built-in batching
+        responses = self.model(
+            prompts,
+            do_sample=False,
+            batch_size=len(prompts),
+            **self.model_kwargs
+        )
+        
+        # Clear GPU cache after batch inference
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Extract generated text from each response
+        return [r[0]['generated_text'] for r in responses]
     
     def generate_prompt(self, context: str, retrieval_question: str) -> str | list[dict[str, str]]:
         """
