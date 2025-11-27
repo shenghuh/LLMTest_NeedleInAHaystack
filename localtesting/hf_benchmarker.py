@@ -10,6 +10,7 @@ from datetime import datetime
 @dataclass
 class BenchmarkConfig:
     model_name: str = "meta-llama/Llama-2-7b-chat-hf"
+    judge_model_name: str = None  # New: separate judge model (None = use same model)
     haystack_path: str = "../PaulGrahamEssays"
     needle: str = "The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day."
     retrieval_question: str = "What is the best thing to do in San Francisco?"
@@ -19,7 +20,7 @@ class BenchmarkConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     max_new_tokens: int = 256
     torch_dtype: str = "float16"
-    use_llm_judge: bool = True  # New: toggle LLM-based evaluation
+    use_llm_judge: bool = True
 
 
 class HFBenchmarker:
@@ -27,8 +28,11 @@ class HFBenchmarker:
         self.config = config
         self.model = None
         self.tokenizer = None
+        self.judge_model = None
+        self.judge_tokenizer = None
         self.haystack_text = ""
         self._load_model()
+        self._load_judge_model()
         self._load_haystack()
 
     def _load_model(self):
@@ -43,6 +47,25 @@ class HFBenchmarker:
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def _load_judge_model(self):
+        """Load separate judge model if specified, otherwise use the main model."""
+        if self.config.judge_model_name and self.config.use_llm_judge:
+            print(f"Loading judge model: {self.config.judge_model_name}")
+            dtype = getattr(torch, self.config.torch_dtype)
+            self.judge_tokenizer = AutoTokenizer.from_pretrained(self.config.judge_model_name)
+            self.judge_model = AutoModelForCausalLM.from_pretrained(
+                self.config.judge_model_name,
+                torch_dtype=dtype,
+                device_map="auto",
+                trust_remote_code=True
+            )
+            if self.judge_tokenizer.pad_token is None:
+                self.judge_tokenizer.pad_token = self.judge_tokenizer.eos_token
+        else:
+            # Use the same model for judging
+            self.judge_model = self.model
+            self.judge_tokenizer = self.tokenizer
 
     def _load_haystack(self):
         texts = []
@@ -119,15 +142,15 @@ Only respond with a JSON object in this format:
 {{"score": <integer 1-10>, "reasoning": "<brief explanation>"}}
 [/INST]"""
 
-        inputs = self.tokenizer(judge_prompt, return_tensors="pt", truncation=True).to(self.model.device)
+        inputs = self.judge_tokenizer(judge_prompt, return_tensors="pt", truncation=True).to(self.judge_model.device)
         with torch.no_grad():
-            outputs = self.model.generate(
+            outputs = self.judge_model.generate(
                 **inputs,
                 max_new_tokens=150,
                 do_sample=False,
-                pad_token_id=self.tokenizer.pad_token_id
+                pad_token_id=self.judge_tokenizer.pad_token_id
             )
-        judge_response = self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        judge_response = self.judge_tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
         
         # Parse the JSON response
         try:
@@ -226,6 +249,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="HuggingFace Needle-in-Haystack Benchmark")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-chat-hf")
+    parser.add_argument("--judge-model", type=str, default=None, help="Separate model for judging (default: use same model)")
     parser.add_argument("--haystack", type=str, default="../PaulGrahamEssays")
     parser.add_argument("--context-lengths", type=int, nargs="+", default=[1000, 2000, 4000])
     parser.add_argument("--depths", type=float, nargs="+", default=[0.0, 0.5, 1.0])
@@ -236,6 +260,7 @@ def main():
     
     config = BenchmarkConfig(
         model_name=args.model,
+        judge_model_name=args.judge_model,
         haystack_path=args.haystack,
         context_lengths=args.context_lengths,
         needle_depths=args.depths,
