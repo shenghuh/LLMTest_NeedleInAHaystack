@@ -4,7 +4,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from jsonargparse import CLI
 
-from . import LLMNeedleHaystackTester, LLMMultiNeedleHaystackTester
+from . import LLMNeedleHaystackBenchmark, LLMMultiNeedleHaystackTester
 from .evaluators import Evaluator, LangSmithEvaluator, OpenAIEvaluator
 from .providers import Anthropic, ModelProvider, OpenAI, Cohere, OpenSource
 from sentence_transformers import SentenceTransformer
@@ -135,7 +135,7 @@ def main():
         tester = LLMMultiNeedleHaystackTester(**args.__dict__)
     else: 
         print("Testing single-needle")
-        tester = LLMNeedleHaystackTester(**args.__dict__)
+        tester = LLMNeedleHaystackBenchmark(**args.__dict__)
     tester.start_test()
 
 if __name__ == "__main__":

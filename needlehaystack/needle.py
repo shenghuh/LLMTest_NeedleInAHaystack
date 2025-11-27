@@ -11,7 +11,7 @@ from .providers import ModelProvider
 
 from datetime import datetime, timezone
 
-class LLMNeedleHaystackTester:
+class LLMNeedleHaystackBenchmark:
     """
     This class is used to test the LLM Needle Haystack.
     """
@@ -82,6 +82,8 @@ class LLMNeedleHaystackTester:
         self.print_ongoing_status = print_ongoing_status
         self.testing_results = []
         self.use_cllp_filter = use_cllp_filter
+        self.filter_model = filter_model
+        self.filter = None
         self.cllp_filter = None
 
         if context_lengths is None:
@@ -113,7 +115,7 @@ class LLMNeedleHaystackTester:
             self.cllp_filter = CLLPFilter(ckpt_path=cllp_ckpt_path)
         if self.filter_model:
             from .clip_filter.filter import Filter
-            self.cllp_filter = Filter(model=self.filter_model)
+            self.filter = Filter(model=self.filter_model)
 
 
         self.model_to_test = model_to_test
@@ -164,6 +166,9 @@ class LLMNeedleHaystackTester:
             context = self.generate_context(context_length, depth_percent)
             if self.cllp_filter is not None:
                 context = self.cllp_filter.filter_context(context, self.retrieval_question)
+            elif self.filter is not None:
+                self.filter.process_context(context)
+                context = self.filter.filter_context(self.retrieval_question)
             contexts.append(context)
             prompts.append(self.model_to_test.generate_prompt(context, self.retrieval_question))
         
@@ -229,6 +234,9 @@ class LLMNeedleHaystackTester:
         # If using CLLP filtering, filter the context down to the most relevant pieces
         if self.cllp_filter is not None:
             context = self.cllp_filter.filter_context(context, self.retrieval_question)
+        elif self.filter is not None:
+            self.filter.process_context(context)
+            context = self.filter.filter_context(self.retrieval_question)
 
         # Prepare your message to send to the model you're going to evaluate
         prompt = self.model_to_test.generate_prompt(context, self.retrieval_question)
