@@ -271,10 +271,10 @@ class VectorQuantizerEMA(nn.Module):
         self,
         num_codes: int,
         code_dim: int,
-        decay: float = 0.99,
-        eps: float = 1e-5,
-        commitment_cost: float = 0.25,
-        diversity_weight: float = 0.1,
+        decay: float = 0.995,
+        eps: float = 1e-8,
+        commitment_cost: float = 0.3,
+        diversity_weight: float = 0.001,
     ):
         """
         Args:
@@ -293,13 +293,156 @@ class VectorQuantizerEMA(nn.Module):
         self.commitment_cost = commitment_cost
         self.diversity_weight = diversity_weight
         
-        # Initialize codebook embedding
+        # Track whether codebook has been initialized with k-means
+        self._kmeans_initialized = False
+        
+        # Initialize codebook embedding (normalize to unit norm to match cosine similarity)
         embedding = torch.randn(num_codes, code_dim)
+        embedding = embedding / (embedding.norm(dim=1, keepdim=True) + self.eps)
         self.register_buffer("embedding", embedding)
         
         # EMA tracking buffers
         self.register_buffer("cluster_size", torch.zeros(num_codes))
         self.register_buffer("embed_avg", embedding.clone())
+    
+    @torch.no_grad()
+    def init_codebook_kmeans(
+        self,
+        data: torch.Tensor,
+        n_iters: int = 20,
+        verbose: bool = False,
+    ):
+        """
+        Initialize codebook using spherical k-means (cosine similarity).
+        
+        This warm-starts the codebook with cluster centroids computed from
+        actual encoder outputs, leading to better initial code utilization.
+        
+        Args:
+            data: Tensor of shape [N, D] containing encoder outputs to cluster.
+            n_iters: Number of k-means iterations.
+            verbose: Whether to print progress.
+        
+        Returns:
+            Final cluster assignments [N].
+        """
+        N, D = data.shape
+        device = data.device
+        
+        if N < self.num_codes:
+            print(f"Warning: data samples ({N}) < num_codes ({self.num_codes}). "
+                  f"Using random init for remaining codes.")
+        
+        # Normalize data for spherical k-means
+        data_norm = data / (data.norm(dim=1, keepdim=True) + self.eps)  # [N, D]
+        
+        # Initialize centroids using k-means++ style initialization
+        centroids = self._kmeans_plusplus_init(data_norm)
+        
+        # Run spherical k-means iterations
+        for i in range(n_iters):
+            # Compute cosine similarities: [N, num_codes]
+            similarities = data_norm @ centroids.t()
+            
+            # Assign each point to nearest centroid
+            assignments = similarities.argmax(dim=1)  # [N]
+            
+            # Update centroids
+            new_centroids = torch.zeros_like(centroids)
+            counts = torch.zeros(self.num_codes, device=device)
+            
+            for k in range(self.num_codes):
+                mask = assignments == k
+                if mask.sum() > 0:
+                    # Mean of assigned points (unnormalized data for proper averaging)
+                    new_centroids[k] = data[mask].mean(dim=0)
+                    counts[k] = mask.sum()
+                else:
+                    # Keep old centroid if no points assigned
+                    new_centroids[k] = centroids[k]
+            
+            # Normalize centroids to unit norm
+            centroids = new_centroids / (new_centroids.norm(dim=1, keepdim=True) + self.eps)
+            
+            if verbose:
+                # Compute usage stats
+                used = (counts > 0).sum().item()
+                print(f"K-means iter {i+1}/{n_iters}: {used}/{self.num_codes} codes used")
+        
+        # Set the codebook to the final centroids
+        self.embedding.data.copy_(centroids)
+        
+        # Initialize EMA buffers based on final assignments
+        final_similarities = data_norm @ centroids.t()
+        final_assignments = final_similarities.argmax(dim=1)
+        
+        # Reset cluster sizes based on initial assignments
+        for k in range(self.num_codes):
+            mask = final_assignments == k
+            self.cluster_size.data[k] = mask.sum().float()
+            if mask.sum() > 0:
+                self.embed_avg.data[k] = data[mask].mean(dim=0)
+            else:
+                self.embed_avg.data[k] = centroids[k]
+        
+        # Normalize embed_avg to be consistent
+        self.embed_avg.data.copy_(
+            self.embedding.data * self.cluster_size.data.unsqueeze(1)
+        )
+        
+        self._kmeans_initialized = True
+        
+        if verbose:
+            used_codes = (self.cluster_size > 0).sum().item()
+            print(f"K-means init complete: {used_codes}/{self.num_codes} codes have assignments")
+        
+        return final_assignments
+    
+    @torch.no_grad()
+    def _kmeans_plusplus_init(self, data_norm: torch.Tensor) -> torch.Tensor:
+        """
+        K-means++ initialization for better starting centroids.
+        
+        Args:
+            data_norm: Normalized data [N, D].
+        
+        Returns:
+            Initial centroids [num_codes, D].
+        """
+        N, D = data_norm.shape
+        device = data_norm.device
+        
+        centroids = torch.zeros(self.num_codes, D, device=device)
+        
+        # Pick first centroid randomly
+        idx = torch.randint(0, N, (1,), device=device).item()
+        centroids[0] = data_norm[idx]
+        
+        for k in range(1, self.num_codes):
+            if k >= N:
+                # If we have more codes than data points, use random vectors
+                centroids[k] = torch.randn(D, device=device)
+                centroids[k] = centroids[k] / (centroids[k].norm() + self.eps)
+                continue
+            
+            # Compute similarities to nearest existing centroid
+            # Using cosine similarity (higher = closer)
+            sims = data_norm @ centroids[:k].t()  # [N, k]
+            max_sims = sims.max(dim=1).values  # [N]
+            
+            # Convert to distance-like measure (lower = farther from existing centroids)
+            # We want to sample points that are far from existing centroids
+            distances = 1 - max_sims  # [N]
+            
+            # Sample proportional to distance squared
+            probs = distances ** 2
+            probs = probs / probs.sum()
+            
+            # Sample next centroid
+            idx = torch.multinomial(probs, 1).item()
+            centroids[k] = data_norm[idx]
+        
+        return centroids
     
     def forward(self, z: torch.Tensor):
         """
@@ -311,16 +454,15 @@ class VectorQuantizerEMA(nn.Module):
         """
         B, D = z.shape
         
-        # Compute L2 distances to all codes: ||z - e||^2 = ||z||^2 + ||e||^2 - 2*z*e
+        # Use cosine similarity for nearest code selection (semantic similarity)
+        # Normalize inputs and embeddings then take argmax of dot product.
         # z: [B, D], embedding: [num_codes, D]
-        distances = (
-            z.pow(2).sum(dim=1, keepdim=True)  # [B, 1]
-            + self.embedding.pow(2).sum(dim=1)  # [num_codes]
-            - 2 * z @ self.embedding.t()  # [B, num_codes]
-        )  # [B, num_codes]
-        
-        # Find nearest code for each input
-        indices = distances.argmin(dim=1)  # [B]
+        z_norm = z / (z.norm(dim=1, keepdim=True) + self.eps)  # [B, D]
+        emb_norm = self.embedding / (self.embedding.norm(dim=1, keepdim=True) + self.eps)  # [num_codes, D]
+        similarities = z_norm @ emb_norm.t()  # [B, num_codes]
+
+        # Find most similar code for each input
+        indices = similarities.argmax(dim=1)  # [B]
         
         # Get quantized vectors
         z_q = F.embedding(indices, self.embedding)  # [B, D]
@@ -344,22 +486,26 @@ class VectorQuantizerEMA(nn.Module):
                 (self.cluster_size + self.eps) / (n + self.num_codes * self.eps) * n
             )
             self.embedding.data.copy_(self.embed_avg / cluster_size_normalized.unsqueeze(1))
+
+            # After EMA update, normalize the codebook vectors to unit norm so that
+            # cosine similarity (used for assignment) remains consistent.
+            emb_norms = self.embedding.data.norm(dim=1, keepdim=True)
+            self.embedding.data.div_(emb_norms + self.eps)
+            
+            # Also update embed_avg to stay consistent with the normalized embeddings
+            # (prevents drift between embed_avg and embedding over time)
+            self.embed_avg.data.copy_(self.embedding.data * cluster_size_normalized.unsqueeze(1))
         
         commitment_loss = F.mse_loss(z, z_q.detach())
         embedding_loss = F.mse_loss(z.detach(), z_q)
         
-        # Diversity regularization: encourage uniform code usage via entropy maximization
-        # Use soft assignments (negative distances -> softmax) for differentiable entropy
-        soft_assignments = F.softmax(-distances, dim=1)  # [B, num_codes]
-        avg_soft_assignments = soft_assignments.mean(dim=0)  # [num_codes]
-        
-        # Entropy of average assignment distribution (higher = more uniform)
-        # H = -sum(p * log(p)), max entropy = log(num_codes) when uniform
-        entropy = -torch.sum(avg_soft_assignments * torch.log(avg_soft_assignments + 1e-10))
+        counts = torch.bincount(indices, minlength=self.num_codes).float()  # [num_codes]
+        probs = counts / counts.sum()  # [num_codes]
+        entropy = -torch.sum(probs * torch.log(probs + 1e-10))
         max_entropy = math.log(self.num_codes)
         
         # Diversity loss: minimize (max_entropy - entropy) to maximize entropy
-        diversity_loss = max_entropy - entropy
+        diversity_loss = (max_entropy - entropy) / max_entropy
         
         vq_loss = commitment_loss * self.commitment_cost + embedding_loss + self.diversity_weight * diversity_loss
         z_q_st = z + (z_q - z).detach()
@@ -473,6 +619,90 @@ class KmerVQVAE(nn.Module):
         logits = self.decoder(z_q_broadcast)  # [B, kmer_len, vocab_size]
         
         return logits, vq_loss, perplexity, indices, diversity_loss
+    
+    @torch.no_grad()
+    def warm_start_codebook(
+        self,
+        dataloader,
+        kmer_len: int,
+        max_samples: int = 50000,
+        n_iters: int = 20,
+        verbose: bool = True,
+    ):
+        """
+        Warm-start the VQ codebook using k-means on encoder outputs.
+        
+        This should be called before training to initialize the codebook
+        with meaningful cluster centroids from actual data.
+        
+        Args:
+            dataloader: DataLoader yielding (token_ids, kmer_start) batches.
+            kmer_len: Length of k-mer.
+            max_samples: Maximum number of samples to collect for k-means.
+            n_iters: Number of k-means iterations.
+            verbose: Whether to print progress.
+        
+        Returns:
+            Cluster assignments for the collected samples.
+        """
+        self.eval()
+        device = next(self.parameters()).device
+        
+        # Collect encoder outputs
+        z_list = []
+        n_collected = 0
+        
+        if verbose:
+            print(f"Collecting encoder outputs for k-means initialization...")
+        
+        for batch in dataloader:
+            if n_collected >= max_samples:
+                break
+            
+            # Handle different batch formats
+            if isinstance(batch, (list, tuple)):
+                token_ids = batch[0]
+                kmer_start = batch[1] if len(batch) > 1 else None
+            else:
+                token_ids = batch
+                kmer_start = None
+            
+            token_ids = token_ids.to(device)
+            B, T = token_ids.shape
+            
+            # Default kmer_start to center if not provided
+            if kmer_start is None:
+                kmer_start = torch.full((B,), (T - kmer_len) // 2, device=device)
+            else:
+                kmer_start = kmer_start.to(device)
+            
+            # Get encoder outputs
+            h = self.encoder(token_ids)  # [B, T, D]
+            
+            # Extract k-mer representations
+            kmer_offsets = torch.arange(kmer_len, device=device)
+            kmer_positions = kmer_start.unsqueeze(1) + kmer_offsets.unsqueeze(0)
+            kmer_positions_expanded = kmer_positions.unsqueeze(-1).expand(-1, -1, self.d_model)
+            kmer_h = torch.gather(h, dim=1, index=kmer_positions_expanded)
+            z = kmer_h.mean(dim=1)  # [B, D]
+            
+            z_list.append(z.cpu())
+            n_collected += B
+        
+        # Concatenate all collected embeddings
+        all_z = torch.cat(z_list, dim=0)[:max_samples].to(device)
+        
+        if verbose:
+            print(f"Collected {all_z.shape[0]} samples, running k-means...")
+        
+        # Run k-means initialization
+        assignments = self.vq.init_codebook_kmeans(
+            all_z,
+            n_iters=n_iters,
+            verbose=verbose,
+        )
+        
+        return assignments
 
 
 if __name__ == "__main__":
@@ -496,7 +726,8 @@ if __name__ == "__main__":
     token_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
     kmer_start = torch.randint(64, 192, (batch_size,))  # Centered k-mer starts
     
-    # Forward pass
+    # Forward pass (before k-means init)
+    print("=== Before K-means Initialization ===")
     logits, vq_loss, perplexity, indices, diversity_loss = model(token_ids, kmer_start, kmer_len)
     
     print(f"logits shape: {logits.shape}")  # [B, kmer_len, vocab_size]
@@ -504,3 +735,50 @@ if __name__ == "__main__":
     print(f"perplexity: {perplexity.item():.2f}")
     print(f"diversity_loss: {diversity_loss.item():.4f}")
     print(f"indices shape: {indices.shape}")  # [B]
+    
+    # Test K-means warm start initialization
+    print("\n=== K-means Warm Start Initialization ===")
+    
+    # Create a simple dummy dataloader for testing
+    class DummyDataset(torch.utils.data.Dataset):
+        def __init__(self, vocab_size, seq_len, n_samples=1000):
+            self.vocab_size = vocab_size
+            self.seq_len = seq_len
+            self.n_samples = n_samples
+        
+        def __len__(self):
+            return self.n_samples
+        
+        def __getitem__(self, idx):
+            token_ids = torch.randint(0, self.vocab_size, (self.seq_len,))
+            kmer_start = torch.randint(64, 192, (1,)).item()
+            return token_ids, kmer_start
+    
+    dummy_dataset = DummyDataset(vocab_size, seq_len, n_samples=500)
+    dummy_loader = torch.utils.data.DataLoader(
+        dummy_dataset, batch_size=32, shuffle=True
+    )
+    
+    # Warm start the codebook
+    assignments = model.warm_start_codebook(
+        dummy_loader,
+        kmer_len=kmer_len,
+        max_samples=500,
+        n_iters=10,
+        verbose=True,
+    )
+    
+    # Forward pass (after k-means init)
+    print("\n=== After K-means Initialization ===")
+    model.train()
+    logits, vq_loss, perplexity, indices, diversity_loss = model(token_ids, kmer_start, kmer_len)
+    
+    print(f"logits shape: {logits.shape}")
+    print(f"vq_loss: {vq_loss.item():.4f}")
+    print(f"perplexity: {perplexity.item():.2f}")
+    print(f"diversity_loss: {diversity_loss.item():.4f}")
+    print(f"indices: {indices.tolist()}")
+    
+    # Check codebook utilization
+    used_codes = (model.vq.cluster_size > 0).sum().item()
+    print(f"\nCodebook utilization: {used_codes}/{model.num_codes} codes used")

@@ -84,12 +84,14 @@ def train_vqvae(
     kmer_len: int = 16,
     stride: int = 128,
     max_tokens_total: int = 100_000_000,
-    d_model: int = 256,
+    d_model: int = 384,
     n_layers: int = 4,
     n_heads: int = 4,
     num_codes: int = 2048,
     wandb_project: str = "kmer-vqvae",
     wandb_run_name: str = None,
+    warmstart_samples: int = 50_000,
+    warmstart_iters: int = 20,
 ):
     # Initialize wandb
     config = {
@@ -109,6 +111,8 @@ def train_vqvae(
         "tokenizer_name": tokenizer_name,
         "eval_every": eval_every,
         "eval_steps": eval_steps,
+        "warmstart_samples": warmstart_samples,
+        "warmstart_iters": warmstart_iters,
     }
     
     wandb.init(
@@ -183,6 +187,36 @@ def train_vqvae(
         "trainable_params": trainable_params,
         "vocab_size": vocab_size,
     })
+    
+    # Warm start codebook with k-means
+    if warmstart_samples > 0:
+        print(f"Warm-starting codebook with k-means ({warmstart_samples} samples, {warmstart_iters} iters)...")
+        
+        # Create a temporary dataloader for warm start
+        warmstart_loader = make_dataloader(
+            batch_size=batch_size,
+            num_workers=4,
+            tokenizer_name=tokenizer_name,
+            window_size=window_size,
+            kmer_len=kmer_len,
+            stride=stride,
+            max_tokens_total=max_tokens_total,
+            verbose=False,
+        )
+        
+        model.warm_start_codebook(
+            warmstart_loader,
+            kmer_len=kmer_len,
+            max_samples=warmstart_samples,
+            n_iters=warmstart_iters,
+            verbose=True,
+        )
+        
+        # Log initial codebook utilization
+        used_codes = (model.vq.cluster_size > 0).sum().item()
+        print(f"Initial codebook utilization: {used_codes}/{num_codes} codes")
+        wandb.log({"init/codebook_utilization": used_codes, "step": 0})
+        print()
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
