@@ -660,7 +660,14 @@ class KmerVQVAE(nn.Module):
                 break
             
             # Handle different batch formats
-            if isinstance(batch, (list, tuple)):
+            if isinstance(batch, dict):
+                # Dict format from make_dataloader: {"tokens": ..., "kmer_start": ..., "kmer_len": ...}
+                token_ids = batch["tokens"]
+                kmer_start = batch.get("kmer_start", None)
+                # Use kmer_len from batch if available
+                if "kmer_len" in batch and batch["kmer_len"] is not None:
+                    kmer_len = batch["kmer_len"][0].item() if hasattr(batch["kmer_len"], "item") or hasattr(batch["kmer_len"][0], "item") else batch["kmer_len"]
+            elif isinstance(batch, (list, tuple)):
                 token_ids = batch[0]
                 kmer_start = batch[1] if len(batch) > 1 else None
             else:
