@@ -6,8 +6,81 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 import wandb
 
-from vqvae_phase1_data import make_dataloader
+# Use web-text-only data for Phase 1a (curriculum learning)
+from vqvae_phase1a_data_webtext import make_dataloader
 from vqvae_phase1_model import KmerVQVAE
+
+
+@torch.no_grad()
+def log_bucket_samples(
+    model,
+    tokens: torch.Tensor,
+    kmer_start: torch.Tensor,
+    kmer_len: int,
+    indices: torch.Tensor,
+    tokenizer,
+    num_samples: int = 8,
+    step: int = 0,
+):
+    """
+    Log sample text → code mappings to wandb.
+    
+    Args:
+        model: The VQ-VAE model.
+        tokens: Input token IDs [B, T].
+        kmer_start: K-mer start positions [B].
+        kmer_len: Length of k-mer.
+        indices: Assigned code indices [B].
+        tokenizer: Tokenizer for decoding.
+        num_samples: Number of samples to log.
+        step: Current training step.
+    """
+    device = tokens.device
+    B = min(num_samples, tokens.shape[0])
+    
+    # Create a table for text → code mappings
+    table_data = []
+    for i in range(B):
+        start = kmer_start[i].item()
+        end = start + kmer_len
+        kmer_tokens = tokens[i, start:end].tolist()
+        kmer_text = tokenizer.decode(kmer_tokens, skip_special_tokens=False)
+        code_idx = indices[i].item()
+        table_data.append([i, kmer_text, code_idx])
+    
+    # Log as wandb table
+    table = wandb.Table(columns=["sample_idx", "kmer_text", "code_idx"], data=table_data)
+    wandb.log({"samples/text_to_code": table, "step": step})
+    
+    # Also log code usage histogram from EMA cluster sizes
+    cluster_sizes = model.vq.cluster_size.cpu().numpy()
+    wandb.log({
+        "codebook/usage_histogram": wandb.Histogram(cluster_sizes),
+        "step": step,
+    })
+    
+    # Log top-K and bottom-K used codes
+    num_codes = model.vq.num_codes
+    sorted_indices = cluster_sizes.argsort()
+    
+    top_k = 10
+    top_codes = sorted_indices[-top_k:][::-1]  # Most used
+    bottom_codes = sorted_indices[:top_k]  # Least used
+    
+    top_table = wandb.Table(
+        columns=["rank", "code_idx", "cluster_size"],
+        data=[[i+1, int(top_codes[i]), float(cluster_sizes[top_codes[i]])] for i in range(top_k)]
+    )
+    bottom_table = wandb.Table(
+        columns=["rank", "code_idx", "cluster_size"],
+        data=[[i+1, int(bottom_codes[i]), float(cluster_sizes[bottom_codes[i]])] for i in range(top_k)]
+    )
+    
+    wandb.log({
+        "codebook/top_codes": top_table,
+        "codebook/bottom_codes": bottom_table,
+        "step": step,
+    })
 
 
 @dataclass
@@ -25,11 +98,11 @@ class VQVAEConfig:
     d_model: int = 384
     n_layers: int = 4
     n_heads: int = 4
-    num_codes: int = 2048
+    num_codes: int = 1024  # Optimal based on experiments (93% utilization at ~950 perplexity)
     
     # VQ-specific hyperparameters
     commitment_cost: float = 0.25  # Weight for commitment loss (encoder output → codebook)
-    diversity_weight: float = 0.01  # Weight for diversity/entropy regularization
+    diversity_weight: float = 0.2  # Weight for diversity/entropy regularization (increased from 0.01)
     ema_decay: float = 0.99  # EMA decay rate for codebook updates
     dead_code_threshold: float = 1.0  # Codes with EMA cluster_size below this are dead
     dead_code_restart_prob: float = 0.01  # Probability of restarting each dead code per step
@@ -39,18 +112,19 @@ class VQVAEConfig:
     window_size: int = 64
     kmer_len: int = 4
     stride: int = 32
-    max_tokens_total: int = 100_000_000
+    max_tokens_total: int = 200_000_000  # Increased for multi-domain training
     
     # Warm start (skipped if loading pretrained model)
     warmstart_samples: int = 50_000
     warmstart_iters: int = 20
-    warmstart_use_teacher: bool = False  # Use teacher model for semantic warm start
-    warmstart_teacher_model: str = "sentence-transformers/all-MiniLM-L6-v2"  # Teacher model name
+    warmstart_use_teacher: bool = True  # Use teacher model for semantic warm start
+    warmstart_teacher_model: str = "sentence-transformers/all-MiniLM-L6-v2"  # Teacher model name (384d matches d_model)
     
     # Logging & evaluation
     log_every: int = 200
     eval_every: int = 1000
     eval_steps: int = 50
+    log_buckets_every: int = 2000  # How often to log detailed bucket/code samples
     
     # Paths & wandb
     save_path: str = "kmer_vqvae_phase1.pt"
@@ -175,6 +249,7 @@ def train_vqvae(config: VQVAEConfig = None, **kwargs):
     ema_decay = config.ema_decay
     dead_code_threshold = config.dead_code_threshold
     dead_code_restart_prob = config.dead_code_restart_prob
+    log_buckets_every = config.log_buckets_every
     
     # Initialize wandb with config
     wandb.init(
@@ -188,6 +263,8 @@ def train_vqvae(config: VQVAEConfig = None, **kwargs):
     wandb.define_metric("train/*", step_metric="step")
     wandb.define_metric("val/*", step_metric="step")
     wandb.define_metric("init/*", step_metric="step")
+    wandb.define_metric("samples/*", step_metric="step")
+    wandb.define_metric("codebook/*", step_metric="step")
     
     print(f"Training KmerVQVAE on {device}")
     print(f"  num_steps: {num_steps}")
@@ -412,8 +489,8 @@ def train_vqvae(config: VQVAEConfig = None, **kwargs):
         kmer_start = batch["kmer_start"].to(device)
         batch_kmer_len = batch["kmer_len"][0].item()
         
-        # Forward pass
-        logits, vq_loss, perplexity, _, diversity_loss = model(tokens, kmer_start, batch_kmer_len)
+        # Forward pass (capture indices for logging)
+        logits, vq_loss, perplexity, indices, diversity_loss = model(tokens, kmer_start, batch_kmer_len)
         
         B = tokens.shape[0]
         kmer_offsets = torch.arange(batch_kmer_len, device=device)
@@ -460,6 +537,12 @@ def train_vqvae(config: VQVAEConfig = None, **kwargs):
             # Get codebook utilization stats
             util_stats = model.vq.get_code_utilization_stats()
             
+            # Compute batch-level code statistics
+            unique_codes_in_batch = indices.unique().numel()
+            code_counts = torch.bincount(indices, minlength=num_codes)
+            max_code_count = code_counts.max().item()
+            codes_used_once = (code_counts == 1).sum().item()
+            
             wandb.log({
                 "train/recon_loss": avg_recon,
                 "train/vq_loss": avg_vq,
@@ -470,6 +553,10 @@ def train_vqvae(config: VQVAEConfig = None, **kwargs):
                 "train/num_dead_codes": util_stats["num_dead_codes"],
                 "train/code_utilization": util_stats["utilization"],
                 "train/ema_perplexity": util_stats["ema_perplexity"],
+                # Batch-level code stats
+                "train/batch_unique_codes": unique_codes_in_batch,
+                "train/batch_max_code_count": max_code_count,  # Most frequent code in batch
+                "train/batch_codes_used_once": codes_used_once,  # Codes used exactly once
                 "step": step,
             })
             
@@ -479,6 +566,19 @@ def train_vqvae(config: VQVAEConfig = None, **kwargs):
             running_perplexity = 0.0
             running_diversity_loss = 0.0
             running_count = 0
+        
+        # Log detailed bucket samples (less frequently)
+        if step % log_buckets_every == 0:
+            log_bucket_samples(
+                model=model,
+                tokens=tokens,
+                kmer_start=kmer_start,
+                kmer_len=batch_kmer_len,
+                indices=indices,
+                tokenizer=tokenizer,
+                num_samples=8,
+                step=step,
+            )
         
         # Evaluation
         if step % eval_every == 0:
@@ -538,71 +638,53 @@ def train_vqvae(config: VQVAEConfig = None, **kwargs):
 
 
 if __name__ == "__main__":
-    # ===========================================
-    # Option 1: Train from scratch
-    # ===========================================
-    # config = VQVAEConfig(
-    #     num_steps=50_000,
-    #     batch_size=256,
-    #     lr=2e-4,
-    #     alpha=1.0,
-    #     d_model=384,
-    #     n_layers=4,
-    #     n_heads=4,
-    #     num_codes=2048,
-    #     commitment_cost=0.25,
-    #     diversity_weight=0.001,
-    #     ema_decay=0.993,
-    #     save_path="kmer_vqvae_phase1.pt",
-    #     wandb_run_name="train-from-scratch",
-    # )
-    
-    # ===========================================
-    # Option 2: Continue training from checkpoint
-    # (with improved VQ hyperparameters)
-    # ===========================================
     config = VQVAEConfig(
-        # Training - additional steps
-        num_steps=30_000,
+        # Training
+        num_steps=75_000,
         batch_size=256,
-        lr=1e-4,  # Lower LR for continued training
+        lr=3e-4,
         alpha=1.0,
         grad_clip=1.0,
         
-        # Model architecture (will be loaded from checkpoint)
+        # Model architecture
         d_model=384,
         n_layers=4,
         n_heads=4,
-        num_codes=2048,
+        num_codes=1024,  # Reduced from 2048 for better utilization
 
-        # VQ - IMPROVED hyperparameters to fix codebook collapse
-        commitment_cost=0.1,        # Lower: less rigid encoder-to-code binding
-        diversity_weight=0.01,       # 10x increase: force code spreading
-        ema_decay=0.9,              # Faster adaptation for dead codes
+        # VQ hyperparameters (conservative anti-collapse settings)
+        commitment_cost=0.25,           # Keep original
+        diversity_weight=0.2,           # 10x from 0.01, moderate increase
+        ema_decay=0.99,                 # Keep stable
+        dead_code_threshold=1.0,        # Conservative dead code detection
+        dead_code_restart_prob=0.01,   # Gentle restart rate
         
         # Data
         tokenizer_name="gpt2",
         window_size=64,
         kmer_len=4,
         stride=32,
-        max_tokens_total=100_000_000,
+        max_tokens_total=200_000_000,
         
-        # Warm start (skipped when resuming)
-        warmstart_samples=50_000,
-        warmstart_iters=20,
+        # Warm start with teacher model
+        warmstart_samples=100_000,
+        warmstart_iters=50,
+        warmstart_use_teacher=True,
+        warmstart_teacher_model="sentence-transformers/all-MiniLM-L6-v2",
         
         # Logging
-        log_every=100,
+        log_every=200,
         eval_every=1000,
         eval_steps=50,
+        log_buckets_every=2000,  # Log detailed bucket samples
         
         # Paths
-        save_path="kmer_vqvae_phase1_continued.pt",
+        save_path="kmer_vqvae_1024code_extended.pt",
         wandb_project="kmer-vqvae",
-        wandb_run_name="continued-training-fix-collapse",
+        wandb_run_name="1024codes-teacher-warmstart-extended",
         
-        # Resume from checkpoint
-        resume_from="kmer_vqvae_phase1.pt",  # Path to pretrained model
+        # Fresh training (no resume)
+        resume_from=None,
         
         # Device
         device="cuda" if torch.cuda.is_available() else "cpu",
