@@ -275,6 +275,8 @@ class VectorQuantizerEMA(nn.Module):
         eps: float = 1e-8,
         commitment_cost: float = 0.3,
         diversity_weight: float = 0.001,
+        dead_code_threshold: float = 1.0,
+        dead_code_restart_prob: float = 0.01,
     ):
         """
         Args:
@@ -284,6 +286,8 @@ class VectorQuantizerEMA(nn.Module):
             eps: Epsilon for numerical stability.
             commitment_cost: Weight for commitment loss.
             diversity_weight: Weight for diversity regularization (entropy maximization).
+            dead_code_threshold: Codes with EMA cluster_size below this are considered dead.
+            dead_code_restart_prob: Probability of restarting a dead code each forward pass.
         """
         super().__init__()
         self.num_codes = num_codes
@@ -292,6 +296,8 @@ class VectorQuantizerEMA(nn.Module):
         self.eps = eps
         self.commitment_cost = commitment_cost
         self.diversity_weight = diversity_weight
+        self.dead_code_threshold = dead_code_threshold
+        self.dead_code_restart_prob = dead_code_restart_prob
         
         # Track whether codebook has been initialized with k-means
         self._kmeans_initialized = False
@@ -495,6 +501,9 @@ class VectorQuantizerEMA(nn.Module):
             # Also update embed_avg to stay consistent with the normalized embeddings
             # (prevents drift between embed_avg and embedding over time)
             self.embed_avg.data.copy_(self.embedding.data * cluster_size_normalized.unsqueeze(1))
+            
+            # Restart dead codes (stochastic, during training only)
+            self._restart_dead_codes(z)
         
         # Commitment loss only (no embedding loss needed with EMA updates)
         commitment_loss = F.mse_loss(z, z_q.detach())
@@ -516,6 +525,80 @@ class VectorQuantizerEMA(nn.Module):
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + self.eps)))
         
         return z_q_st, vq_loss, perplexity, indices, diversity_loss
+    
+    def _restart_dead_codes(self, z: torch.Tensor):
+        """
+        Restart dead codes by replacing them with samples from the current batch.
+        A code is considered "dead" if its EMA cluster_size is below the threshold.
+        
+        This helps prevent codebook collapse by reinitializing codes that are never used.
+        
+        Args:
+            z: Current batch of encoder outputs [B, D], used to sample replacements.
+        """
+        # Find dead codes
+        dead_mask = self.cluster_size < self.dead_code_threshold  # [num_codes]
+        num_dead = dead_mask.sum().item()
+        
+        if num_dead == 0:
+            return
+        
+        # Stochastic restart: only restart a subset of dead codes each step
+        # This prevents sudden large changes to the codebook
+        dead_indices = torch.where(dead_mask)[0]
+        
+        # Sample which dead codes to restart (with probability dead_code_restart_prob)
+        restart_mask = torch.rand(num_dead, device=z.device) < self.dead_code_restart_prob
+        codes_to_restart = dead_indices[restart_mask]
+        num_restart = len(codes_to_restart)
+        
+        if num_restart == 0:
+            return
+        
+        # Sample random indices from the current batch (with replacement if needed)
+        B = z.shape[0]
+        sample_indices = torch.randint(0, B, (num_restart,), device=z.device)
+        new_codes = z[sample_indices]  # [num_restart, D]
+        
+        # Normalize to unit norm (for cosine similarity)
+        new_codes = new_codes / (new_codes.norm(dim=1, keepdim=True) + self.eps)
+        
+        # Add small noise to break ties and encourage diversity
+        noise = torch.randn_like(new_codes) * 0.01
+        new_codes = new_codes + noise
+        new_codes = new_codes / (new_codes.norm(dim=1, keepdim=True) + self.eps)
+        
+        # Update the codebook
+        self.embedding.data[codes_to_restart] = new_codes
+        
+        # Reset the EMA stats for restarted codes
+        self.cluster_size.data[codes_to_restart] = self.dead_code_threshold  # Start at threshold
+        self.embed_avg.data[codes_to_restart] = new_codes * self.dead_code_threshold
+    
+    def get_code_utilization_stats(self) -> dict:
+        """
+        Get statistics about codebook utilization.
+        
+        Returns:
+            Dictionary with utilization statistics.
+        """
+        alive_mask = self.cluster_size >= self.dead_code_threshold
+        num_alive = alive_mask.sum().item()
+        utilization = num_alive / self.num_codes
+        
+        # Compute perplexity from EMA cluster sizes
+        probs = self.cluster_size / (self.cluster_size.sum() + self.eps)
+        perplexity = torch.exp(-torch.sum(probs * torch.log(probs + self.eps))).item()
+        
+        return {
+            "num_alive_codes": num_alive,
+            "num_dead_codes": self.num_codes - num_alive,
+            "utilization": utilization,
+            "ema_perplexity": perplexity,
+            "min_cluster_size": self.cluster_size.min().item(),
+            "max_cluster_size": self.cluster_size.max().item(),
+            "mean_cluster_size": self.cluster_size.mean().item(),
+        }
 
 
 class KmerVQVAE(nn.Module):
@@ -538,6 +621,8 @@ class KmerVQVAE(nn.Module):
         ema_decay: float = 0.995,
         commitment_cost: float = 0.3,
         diversity_weight: float = 0.001,
+        dead_code_threshold: float = 1.0,
+        dead_code_restart_prob: float = 0.01,
     ):
         """
         Args:
@@ -551,6 +636,8 @@ class KmerVQVAE(nn.Module):
             ema_decay: EMA decay rate for codebook updates.
             commitment_cost: Weight for commitment loss.
             diversity_weight: Weight for diversity regularization.
+            dead_code_threshold: Codes with cluster_size below this are considered dead.
+            dead_code_restart_prob: Probability of restarting each dead code per step.
         """
         super().__init__()
         assert d_model == code_dim, f"d_model ({d_model}) must equal code_dim ({code_dim})"
@@ -579,6 +666,8 @@ class KmerVQVAE(nn.Module):
             decay=ema_decay,
             commitment_cost=commitment_cost,
             diversity_weight=diversity_weight,
+            dead_code_threshold=dead_code_threshold,
+            dead_code_restart_prob=dead_code_restart_prob,
         )
         
         # Decoder (simple linear projection to vocab)
@@ -736,6 +825,189 @@ class KmerVQVAE(nn.Module):
         )
         
         return assignments
+    
+    @torch.no_grad()
+    def warm_start_codebook_with_teacher(
+        self,
+        dataloader,
+        tokenizer,
+        kmer_len: int,
+        teacher_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        max_samples: int = 50000,
+        n_iters: int = 20,
+        teacher_batch_size: int = 64,
+        verbose: bool = True,
+    ):
+        """
+        Warm-start the VQ codebook using a teacher sentence embedding model.
+        
+        This uses a pretrained sentence encoder to generate semantic embeddings
+        for k-mer text windows, then clusters them to initialize the codebook.
+        The codebook is then projected to match the VQ-VAE's code dimension.
+        
+        Args:
+            dataloader: DataLoader yielding (token_ids, kmer_start) batches.
+            tokenizer: Tokenizer used to decode tokens back to text.
+            kmer_len: Length of k-mer.
+            teacher_model_name: HuggingFace model name for sentence embeddings.
+                Options: "sentence-transformers/all-MiniLM-L6-v2" (384d, fast)
+                         "BAAI/bge-small-en-v1.5" (384d, good quality)
+                         "sentence-transformers/all-mpnet-base-v2" (768d, best quality)
+            max_samples: Maximum number of samples to collect.
+            n_iters: Number of k-means iterations.
+            teacher_batch_size: Batch size for teacher model inference.
+            verbose: Whether to print progress.
+        
+        Returns:
+            Tuple of (assignments, projection_matrix) where projection_matrix
+            can be used to align encoder outputs to the teacher space.
+        """
+        from sentence_transformers import SentenceTransformer
+        
+        device = next(self.parameters()).device
+        
+        if verbose:
+            print(f"Loading teacher model: {teacher_model_name}")
+        
+        # Load teacher model
+        teacher = SentenceTransformer(teacher_model_name, device=str(device))
+        teacher_dim = teacher.get_sentence_embedding_dimension()
+        
+        if verbose:
+            print(f"Teacher embedding dimension: {teacher_dim}")
+            print(f"VQ code dimension: {self.code_dim}")
+        
+        # Collect k-mer texts and their positions
+        kmer_texts = []
+        n_collected = 0
+        
+        if verbose:
+            print(f"Collecting k-mer texts for teacher encoding...")
+        
+        for batch in dataloader:
+            if n_collected >= max_samples:
+                break
+            
+            # Handle different batch formats
+            if isinstance(batch, dict):
+                token_ids = batch["tokens"]
+                kmer_start = batch.get("kmer_start", None)
+                if "kmer_len" in batch and batch["kmer_len"] is not None:
+                    batch_kmer_len = batch["kmer_len"]
+                    if hasattr(batch_kmer_len, "shape") and len(batch_kmer_len.shape) > 0:
+                        kmer_len = batch_kmer_len[0].item()
+                    elif hasattr(batch_kmer_len, "item"):
+                        kmer_len = batch_kmer_len.item()
+                    else:
+                        kmer_len = int(batch_kmer_len)
+            elif isinstance(batch, (list, tuple)):
+                token_ids = batch[0]
+                kmer_start = batch[1] if len(batch) > 1 else None
+            else:
+                token_ids = batch
+                kmer_start = None
+            
+            B, T = token_ids.shape
+            
+            # Default kmer_start to center if not provided
+            if kmer_start is None:
+                kmer_start = torch.full((B,), (T - kmer_len) // 2)
+            
+            # Extract k-mer tokens and decode to text
+            for i in range(B):
+                if n_collected >= max_samples:
+                    break
+                start = kmer_start[i].item()
+                end = start + kmer_len
+                kmer_tokens = token_ids[i, start:end].tolist()
+                
+                # Decode to text
+                text = tokenizer.decode(kmer_tokens, skip_special_tokens=True)
+                if text.strip():  # Only add non-empty texts
+                    kmer_texts.append(text)
+                    n_collected += 1
+        
+        if verbose:
+            print(f"Collected {len(kmer_texts)} k-mer texts")
+            print(f"Example texts: {kmer_texts[:3]}")
+        
+        # Encode with teacher model
+        if verbose:
+            print(f"Encoding with teacher model...")
+        
+        teacher_embeddings = teacher.encode(
+            kmer_texts,
+            batch_size=teacher_batch_size,
+            show_progress_bar=verbose,
+            convert_to_tensor=True,
+            normalize_embeddings=True,  # Unit normalize for cosine similarity
+        )
+        teacher_embeddings = teacher_embeddings.to(device)
+        
+        if verbose:
+            print(f"Teacher embeddings shape: {teacher_embeddings.shape}")
+        
+        # If dimensions don't match, we need to project
+        # Learn a simple linear projection from teacher space to code space
+        projection = None
+        if teacher_dim != self.code_dim:
+            if verbose:
+                print(f"Learning projection from {teacher_dim}d to {self.code_dim}d...")
+            
+            # Use PCA-like projection (SVD of teacher embeddings)
+            # Center the data
+            mean = teacher_embeddings.mean(dim=0, keepdim=True)
+            centered = teacher_embeddings - mean
+            
+            # SVD to get principal components
+            U, S, Vh = torch.linalg.svd(centered, full_matrices=False)
+            
+            # Take top code_dim components
+            if self.code_dim <= teacher_dim:
+                # Reduce dimension
+                projection_matrix = Vh[:self.code_dim].T  # [teacher_dim, code_dim]
+            else:
+                # Pad with random orthogonal vectors
+                projection_matrix = torch.zeros(teacher_dim, self.code_dim, device=device)
+                projection_matrix[:, :teacher_dim] = Vh.T
+                # Add random vectors for extra dimensions
+                extra = torch.randn(teacher_dim, self.code_dim - teacher_dim, device=device)
+                extra = torch.linalg.qr(extra)[0]  # Orthogonalize
+                projection_matrix[:, teacher_dim:] = extra
+            
+            # Project embeddings
+            projected_embeddings = centered @ projection_matrix
+            
+            # Re-normalize after projection
+            projected_embeddings = F.normalize(projected_embeddings, dim=-1)
+            
+            projection = {
+                "matrix": projection_matrix,
+                "mean": mean,
+            }
+        else:
+            projected_embeddings = teacher_embeddings
+        
+        if verbose:
+            print(f"Projected embeddings shape: {projected_embeddings.shape}")
+            print(f"Running k-means clustering...")
+        
+        # Run k-means on projected teacher embeddings
+        assignments = self.vq.init_codebook_kmeans(
+            projected_embeddings,
+            n_iters=n_iters,
+            verbose=verbose,
+        )
+        
+        # Clean up teacher model to free memory
+        del teacher
+        torch.cuda.empty_cache()
+        
+        if verbose:
+            used_codes = (self.vq.cluster_size > 0).sum().item()
+            print(f"Teacher-based init complete: {used_codes}/{self.num_codes} codes initialized")
+        
+        return assignments, projection
 
 
 if __name__ == "__main__":

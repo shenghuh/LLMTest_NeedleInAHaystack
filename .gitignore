@@ -3,6 +3,7 @@
 **/results
 **/*.sh
 **/wandb
+**/*.pt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
