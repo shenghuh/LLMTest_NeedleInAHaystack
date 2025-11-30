@@ -496,24 +496,24 @@ class VectorQuantizerEMA(nn.Module):
             # (prevents drift between embed_avg and embedding over time)
             self.embed_avg.data.copy_(self.embedding.data * cluster_size_normalized.unsqueeze(1))
         
+        # Commitment loss only (no embedding loss needed with EMA updates)
         commitment_loss = F.mse_loss(z, z_q.detach())
-        embedding_loss = F.mse_loss(z.detach(), z_q)
         
         counts = torch.bincount(indices, minlength=self.num_codes).float()  # [num_codes]
         probs = counts / counts.sum()  # [num_codes]
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+        entropy = -torch.sum(probs * torch.log(probs + self.eps))
         max_entropy = math.log(self.num_codes)
         
         # Diversity loss: minimize (max_entropy - entropy) to maximize entropy
         diversity_loss = (max_entropy - entropy) / max_entropy
         
-        vq_loss = commitment_loss * self.commitment_cost + embedding_loss + self.diversity_weight * diversity_loss
+        vq_loss = commitment_loss * self.commitment_cost + self.diversity_weight * diversity_loss
         z_q_st = z + (z_q - z).detach()
         
         # Compute perplexity from code usage histogram (hard assignments)
         encodings = F.one_hot(indices, self.num_codes).float()
         avg_probs = encodings.mean(dim=0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + self.eps)))
         
         return z_q_st, vq_loss, perplexity, indices, diversity_loss
 
@@ -535,6 +535,9 @@ class KmerVQVAE(nn.Module):
         max_len: int = 512,
         num_codes: int = 2048,
         code_dim: int = 256,
+        ema_decay: float = 0.995,
+        commitment_cost: float = 0.3,
+        diversity_weight: float = 0.001,
     ):
         """
         Args:
@@ -545,6 +548,9 @@ class KmerVQVAE(nn.Module):
             max_len: Maximum sequence length.
             num_codes: Number of codes in VQ codebook.
             code_dim: Dimension of code vectors.
+            ema_decay: EMA decay rate for codebook updates.
+            commitment_cost: Weight for commitment loss.
+            diversity_weight: Weight for diversity regularization.
         """
         super().__init__()
         assert d_model == code_dim, f"d_model ({d_model}) must equal code_dim ({code_dim})"
@@ -567,7 +573,13 @@ class KmerVQVAE(nn.Module):
         )
         
         # Vector Quantizer
-        self.vq = VectorQuantizerEMA(num_codes=num_codes, code_dim=code_dim)
+        self.vq = VectorQuantizerEMA(
+            num_codes=num_codes,
+            code_dim=code_dim,
+            decay=ema_decay,
+            commitment_cost=commitment_cost,
+            diversity_weight=diversity_weight,
+        )
         
         # Decoder (simple linear projection to vocab)
         self.decoder = nn.Linear(code_dim, vocab_size)
@@ -664,9 +676,16 @@ class KmerVQVAE(nn.Module):
                 # Dict format from make_dataloader: {"tokens": ..., "kmer_start": ..., "kmer_len": ...}
                 token_ids = batch["tokens"]
                 kmer_start = batch.get("kmer_start", None)
-                # Use kmer_len from batch if available
+                # Use kmer_len from batch if available (overrides function parameter for consistency)
                 if "kmer_len" in batch and batch["kmer_len"] is not None:
-                    kmer_len = batch["kmer_len"][0].item() if hasattr(batch["kmer_len"], "item") or hasattr(batch["kmer_len"][0], "item") else batch["kmer_len"]
+                    batch_kmer_len = batch["kmer_len"]
+                    # Handle both scalar and batched tensor
+                    if hasattr(batch_kmer_len, "shape") and len(batch_kmer_len.shape) > 0:
+                        kmer_len = batch_kmer_len[0].item()
+                    elif hasattr(batch_kmer_len, "item"):
+                        kmer_len = batch_kmer_len.item()
+                    else:
+                        kmer_len = int(batch_kmer_len)
             elif isinstance(batch, (list, tuple)):
                 token_ids = batch[0]
                 kmer_start = batch[1] if len(batch) > 1 else None

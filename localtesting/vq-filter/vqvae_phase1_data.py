@@ -13,10 +13,19 @@ warnings.filterwarnings("ignore", message=".*trust_remote_code.*")
 warnings.filterwarnings("ignore", message=".*loading script.*")
 
 
-def load_texts(verbose: bool = True) -> List[str]:
+def load_texts(verbose: bool = True, split: str = "train", val_ratio: float = 0.05, seed: int = 42) -> List[str]:
     """
     Load and combine texts from multiple datasets.
-    Returns a shuffled list of text strings.
+    Returns a shuffled list of text strings for the specified split.
+    
+    Args:
+        verbose: Whether to print loading progress.
+        split: "train" or "val" - which split to return.
+        val_ratio: Fraction of data to use for validation.
+        seed: Random seed for reproducible train/val split.
+    
+    Returns:
+        List of text strings for the specified split.
     """
     all_texts = []
     
@@ -79,10 +88,28 @@ def load_texts(verbose: bool = True) -> List[str]:
     if verbose:
         print(f"Total texts loaded: {len(all_texts)}")
     
-    # Shuffle all texts
-    random.shuffle(all_texts)
+    # Deterministic shuffle with seed for reproducible split
+    rng = random.Random(seed)
+    rng.shuffle(all_texts)
     
-    return all_texts
+    # Split into train and val
+    n_val = int(len(all_texts) * val_ratio)
+    if split == "val":
+        texts = all_texts[:n_val]
+        if verbose:
+            print(f"Using validation split: {len(texts)} texts")
+    else:  # train
+        texts = all_texts[n_val:]
+        if verbose:
+            print(f"Using training split: {len(texts)} texts")
+    
+    # Shuffle again with different seed per split for variety during training
+    # (but still deterministic for reproducibility)
+    split_seed = seed + (1 if split == "val" else 2)
+    rng2 = random.Random(split_seed)
+    rng2.shuffle(texts)
+    
+    return texts
 
 
 class KmerWindowDataset(IterableDataset):
@@ -94,9 +121,9 @@ class KmerWindowDataset(IterableDataset):
         self,
         texts: List[str],
         tokenizer_name: str = "gpt2",
-        window_size: int = 256,
-        kmer_len: int = 16,
-        stride: int = 128,
+        window_size: int = 64,
+        kmer_len: int = 4,
+        stride: int = 32,
         max_tokens_total: int = 50_000_000,
     ):
         """
@@ -171,11 +198,12 @@ def make_dataloader(
     batch_size: int = 256,
     num_workers: int = 4,
     tokenizer_name: str = "gpt2",
-    window_size: int = 256,
-    kmer_len: int = 16,
-    stride: int = 128,
+    window_size: int = 64,
+    kmer_len: int = 4,
+    stride: int = 32,
     max_tokens_total: int = 50_000_000,
     verbose: bool = True,
+    split: str = "train",
 ) -> DataLoader:
     """
     Create a DataLoader from loaded texts.
@@ -189,13 +217,14 @@ def make_dataloader(
         stride: Stride for sliding window.
         max_tokens_total: Approximate budget for total tokens.
         verbose: Whether to print loading progress.
+        split: "train" or "val" - which data split to use.
     
     Returns:
         DataLoader yielding batches of token windows with k-mer positions.
     """
     if verbose:
-        print("Loading texts for dataset...")
-    texts = load_texts(verbose=verbose)
+        print(f"Loading texts for dataset ({split} split)...")
+    texts = load_texts(verbose=verbose, split=split)
     
     if verbose:
         print("Creating KmerWindowDataset...")

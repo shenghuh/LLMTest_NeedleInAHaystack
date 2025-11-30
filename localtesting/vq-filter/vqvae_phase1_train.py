@@ -1,12 +1,64 @@
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from dataclasses import dataclass, field, asdict
 from transformers import AutoTokenizer
 from tqdm import tqdm
 import wandb
 
 from vqvae_phase1_data import make_dataloader
 from vqvae_phase1_model import KmerVQVAE
+
+
+@dataclass
+class VQVAEConfig:
+    """Configuration for VQ-VAE training."""
+    
+    # Training
+    num_steps: int = 100_000
+    batch_size: int = 256
+    lr: float = 3e-4
+    alpha: float = 0.25  # VQ loss weight in total loss
+    grad_clip: float = 1.0
+    
+    # Model architecture
+    d_model: int = 384
+    n_layers: int = 4
+    n_heads: int = 4
+    num_codes: int = 2048
+    
+    # VQ-specific hyperparameters
+    commitment_cost: float = 0.25  # Weight for commitment loss (encoder output → codebook)
+    diversity_weight: float = 0.01  # Weight for diversity/entropy regularization
+    ema_decay: float = 0.99  # EMA decay rate for codebook updates
+    
+    # Data
+    tokenizer_name: str = "gpt2"
+    window_size: int = 64
+    kmer_len: int = 4
+    stride: int = 32
+    max_tokens_total: int = 100_000_000
+    
+    # Warm start
+    warmstart_samples: int = 50_000
+    warmstart_iters: int = 20
+    
+    # Logging & evaluation
+    log_every: int = 200
+    eval_every: int = 1000
+    eval_steps: int = 50
+    
+    # Paths & wandb
+    save_path: str = "kmer_vqvae_phase1.pt"
+    wandb_project: str = "kmer-vqvae"
+    wandb_run_name: str = None
+    
+    # Device
+    device: str = "cuda"
+    
+    def to_dict(self) -> dict:
+        """Convert config to dictionary for wandb logging."""
+        return asdict(self)
 
 
 @torch.no_grad()
@@ -34,6 +86,7 @@ def evaluate(model, val_iter, val_dataloader, device, vocab_size, pad_token_id, 
                 stride=stride * 2,
                 max_tokens_total=max_tokens_total // 10,
                 verbose=False,
+                split="val",
             )
             val_iter = iter(val_dataloader)
             batch = next(val_iter)
@@ -68,58 +121,63 @@ def evaluate(model, val_iter, val_dataloader, device, vocab_size, pad_token_id, 
     }, val_iter, val_dataloader
 
 
-def train_vqvae(
-    num_steps: int = 100_000,
-    batch_size: int = 256,
-    lr: float = 3e-4,
-    device: str = "cuda",
-    log_every: int = 200,
-    eval_every: int = 1000,
-    eval_steps: int = 50,
-    save_path: str = "kmer_vqvae_phase1.pt",
-    tokenizer_name: str = "gpt2",
-    alpha: float = 0.25,
-    grad_clip: float = 1.0,
-    window_size: int = 256,
-    kmer_len: int = 16,
-    stride: int = 128,
-    max_tokens_total: int = 100_000_000,
-    d_model: int = 384,
-    n_layers: int = 4,
-    n_heads: int = 4,
-    num_codes: int = 2048,
-    wandb_project: str = "kmer-vqvae",
-    wandb_run_name: str = None,
-    warmstart_samples: int = 50_000,
-    warmstart_iters: int = 20,
-):
-    # Initialize wandb
-    config = {
-        "num_steps": num_steps,
-        "batch_size": batch_size,
-        "lr": lr,
-        "alpha": alpha,
-        "grad_clip": grad_clip,
-        "window_size": window_size,
-        "kmer_len": kmer_len,
-        "stride": stride,
-        "max_tokens_total": max_tokens_total,
-        "d_model": d_model,
-        "n_layers": n_layers,
-        "n_heads": n_heads,
-        "num_codes": num_codes,
-        "tokenizer_name": tokenizer_name,
-        "eval_every": eval_every,
-        "eval_steps": eval_steps,
-        "warmstart_samples": warmstart_samples,
-        "warmstart_iters": warmstart_iters,
-    }
+def train_vqvae(config: VQVAEConfig = None, **kwargs):
+    """
+    Train a VQ-VAE model on k-mer reconstruction.
     
+    Args:
+        config: VQVAEConfig object with all hyperparameters.
+        **kwargs: Override specific config values.
+    """
+    # Create config if not provided, and apply any overrides
+    if config is None:
+        config = VQVAEConfig(**kwargs)
+    else:
+        # Apply any kwargs overrides to the config
+        for key, value in kwargs.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+    
+    # Extract config values for convenience
+    num_steps = config.num_steps
+    batch_size = config.batch_size
+    lr = config.lr
+    device = config.device
+    log_every = config.log_every
+    eval_every = config.eval_every
+    eval_steps = config.eval_steps
+    save_path = config.save_path
+    tokenizer_name = config.tokenizer_name
+    alpha = config.alpha
+    grad_clip = config.grad_clip
+    window_size = config.window_size
+    kmer_len = config.kmer_len
+    stride = config.stride
+    max_tokens_total = config.max_tokens_total
+    d_model = config.d_model
+    n_layers = config.n_layers
+    n_heads = config.n_heads
+    num_codes = config.num_codes
+    wandb_project = config.wandb_project
+    wandb_run_name = config.wandb_run_name
+    warmstart_samples = config.warmstart_samples
+    warmstart_iters = config.warmstart_iters
+    commitment_cost = config.commitment_cost
+    diversity_weight = config.diversity_weight
+    ema_decay = config.ema_decay
+    
+    # Initialize wandb with config
     wandb.init(
         project=wandb_project,
         name=wandb_run_name,
-        config=config,
+        config=config.to_dict(),
     )
+    
+    # Define step as the x-axis for all metrics
+    wandb.define_metric("step")
+    wandb.define_metric("train/*", step_metric="step")
+    wandb.define_metric("val/*", step_metric="step")
+    wandb.define_metric("init/*", step_metric="step")
     
     print(f"Training KmerVQVAE on {device}")
     print(f"  num_steps: {num_steps}")
@@ -138,9 +196,10 @@ def train_vqvae(
         kmer_len=kmer_len,
         stride=stride,
         max_tokens_total=max_tokens_total,
+        split="train",
     )
     
-    # Create validation dataloader (smaller, separate data)
+    # Create validation dataloader (separate data split)
     print("Creating validation dataloader...")
     val_dataloader = make_dataloader(
         batch_size=batch_size,
@@ -149,8 +208,9 @@ def train_vqvae(
         window_size=window_size,
         kmer_len=kmer_len,
         stride=stride * 2,  # Larger stride for less overlap
-        max_tokens_total=max_tokens_total // 10,  # 10% of training data
+        max_tokens_total=max_tokens_total // 10,  # Limit val tokens
         verbose=False,
+        split="val",
     )
     val_iter = iter(val_dataloader)
     
@@ -171,6 +231,9 @@ def train_vqvae(
         max_len=window_size,
         num_codes=num_codes,
         code_dim=d_model,  # Must equal d_model
+        ema_decay=ema_decay,
+        commitment_cost=commitment_cost,
+        diversity_weight=diversity_weight,
     )
     model = model.to(device)
     
@@ -192,7 +255,7 @@ def train_vqvae(
     if warmstart_samples > 0:
         print(f"Warm-starting codebook with k-means ({warmstart_samples} samples, {warmstart_iters} iters)...")
         
-        # Create a temporary dataloader for warm start
+        # Create a temporary dataloader for warm start (use train split)
         warmstart_loader = make_dataloader(
             batch_size=batch_size,
             num_workers=4,
@@ -202,6 +265,7 @@ def train_vqvae(
             stride=stride,
             max_tokens_total=max_tokens_total,
             verbose=False,
+            split="train",
         )
         
         model.warm_start_codebook(
@@ -249,6 +313,7 @@ def train_vqvae(
                 stride=stride,
                 max_tokens_total=max_tokens_total,
                 verbose=False,
+                split="train",
             )
             data_iter = iter(dataloader)
             batch = next(data_iter)
@@ -324,9 +389,10 @@ def train_vqvae(
                 model, val_iter, val_dataloader, device, vocab_size, pad_token_id,
                 eval_steps, alpha, window_size, kmer_len, stride, max_tokens_total, tokenizer_name
             )
+            # Log val metrics with same step (won't create duplicate x-axis points)
             wandb.log({**val_metrics, "step": step})
             tqdm.write(
-                f"  [Val] recon: {val_metrics['val/recon_loss']:.4f} | "
+                f"  [Val @ step {step}] recon: {val_metrics['val/recon_loss']:.4f} | "
                 f"vq: {val_metrics['val/vq_loss']:.4f} | "
                 f"perp: {val_metrics['val/perplexity']:.1f}"
             )
@@ -369,14 +435,50 @@ def train_vqvae(
 
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    train_vqvae(
+    # Create config with desired hyperparameters
+    config = VQVAEConfig(
+        # Training
         num_steps=50_000,
         batch_size=256,
         lr=2e-4,
-        device=device,
-        log_every=100,
-        save_path="kmer_vqvae_phase1.pt",
+        alpha=1.0,
+        grad_clip=1.0,
+        
+        # Model
+        d_model=384,
+        n_layers=4,
+        n_heads=4,
+        num_codes=2048,
+
+        # VQ
+        commitment_cost= 0.25,
+        diversity_weight= 0.001,
+        ema_decay= 0.993,
+        
+        # Data
         tokenizer_name="gpt2",
+        window_size=64,
+        kmer_len=4,
+        stride=32,
+        max_tokens_total=100_000_000,
+        
+        # Warm start
+        warmstart_samples=50_000,
+        warmstart_iters=20,
+        
+        # Logging
+        log_every=100,
+        eval_every=1000,
+        eval_steps=50,
+        
+        # Paths
+        save_path="kmer_vqvae_phase1.pt",
+        wandb_project="kmer-vqvae",
+        wandb_run_name=None,
+        
+        # Device
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
+    
+    # Train with config
+    train_vqvae(config)
