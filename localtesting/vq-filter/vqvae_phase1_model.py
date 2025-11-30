@@ -623,6 +623,10 @@ class KmerVQVAE(nn.Module):
         # Pool across k-mer dimension (mean pooling)
         z = kmer_h.mean(dim=1)  # [B, D]
         
+        # Normalize encoder output to unit norm (matches normalized codebook)
+        # This ensures commitment loss is bounded and semantically meaningful
+        z = F.normalize(z, dim=-1)  # [B, D] with unit norm
+        
         # Quantize
         z_q_st, vq_loss, perplexity, indices, diversity_loss = self.vq(z)
         
@@ -711,6 +715,9 @@ class KmerVQVAE(nn.Module):
             kmer_positions_expanded = kmer_positions.unsqueeze(-1).expand(-1, -1, self.d_model)
             kmer_h = torch.gather(h, dim=1, index=kmer_positions_expanded)
             z = kmer_h.mean(dim=1)  # [B, D]
+            
+            # Normalize to unit norm (consistent with forward pass)
+            z = F.normalize(z, dim=-1)
             
             z_list.append(z.cpu())
             n_collected += B
